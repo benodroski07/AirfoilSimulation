@@ -1,1 +1,474 @@
+import React, { useMemo, useRef, useState } from "react";
+import * as THREE from "three";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { OrbitControls } from "@react-three/drei";
+import { STLExporter } from "three-stdlib";
+
+/**
+ * Airfoil Modeling System — single-file React app
+ * - NACA 4‑digit airfoil generator (e.g., 2412, 0012)
+ * - Parametric wing: chord, span, taper, twist, dihedral
+ * - Mesh resolution controls
+ * - Live 3D view with orbit controls + grid/axes
+ * - Export to STL (triangulated mesh)
+ *
+ * Notes
+ * - All units are in meters by default
+ * - Coordinates are generated with cosine spacing for better LE fidelity
+ * - Geometry is built by stacking cross-sections along span then stitching quads
+ */
+
+function cosineSpacing(n) {
+  const xs = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    xs.push((1 - Math.cos(Math.PI * t)) / 2); // [0..1]
+  }
+  return xs;
+}
+
+function naca4Coordinates(digits = "0012", n = 200, chord = 1.0) {
+  if (!/^\d{4}$/.test(digits)) throw new Error("Use a 4‑digit NACA code, e.g., 2412");
+  const m = parseInt(digits[0]) / 100; // max camber
+  const p = parseInt(digits[1]) / 10; // location of max camber
+  const t = parseInt(digits.slice(2)) / 100; // thickness
+
+  const xs01 = cosineSpacing(n);
+  const xs = xs01.map((xi) => xi * chord);
+
+  const yt = xs01.map((xi) => {
+    // thickness distribution (classic formula)
+    const term = 5 * t * (
+      0.2969 * Math.sqrt(xi) - 0.1260 * xi - 0.3516 * xi ** 2 + 0.2843 * xi ** 3 - 0.1015 * xi ** 4
+    );
+    return term * chord;
+  });
+
+  const yc = new Array(n).fill(0);
+  const dyc = new Array(n).fill(0);
+
+  for (let i = 0; i < n; i++) {
+    const xi = xs01[i];
+    if (p === 0) {
+      yc[i] = 0;
+      dyc[i] = 0;
+    } else if (xi < p) {
+      yc[i] = (m / (p ** 2)) * (2 * p * xi - xi ** 2);
+      dyc[i] = (2 * m / (p ** 2)) * (p - xi);
+    } else {
+      yc[i] = (m / ((1 - p) ** 2)) * ((1 - 2 * p) + 2 * p * xi - xi ** 2);
+      dyc[i] = (2 * m / ((1 - p) ** 2)) * (p - xi);
+    }
+    yc[i] *= chord;
+  }
+
+  const up = [], lo = [];
+  for (let i = 0; i < n; i++) {
+    const theta = Math.atan(dyc[i]);
+    const x = xs[i];
+    const y_c = yc[i];
+    const y_t = yt[i];
+    up.push([x - y_t * Math.sin(theta), y_c + y_t * Math.cos(theta)]);
+    lo.push([x + y_t * Math.sin(theta), y_c - y_t * Math.cos(theta)]);
+  }
+  return { upper: up, lower: lo };
+}
+
+function buildWingGeometry({
+  naca = "0012",
+  chord = 1,
+  span = 0.3,
+  sections = 60,
+  chordSamples = 200,
+  taper = 1.0,
+  twistDeg = 0,
+  dihedralDeg = 0,
+  // New: winglet + fillet params
+  wingletHeight = 0.15,
+  wingletTaper = 0.6,
+  wingletCantDeg = 60, // 0=flat, 90=vertical
+  wingletToeDeg = 0,   // yaw in degrees (+ toe-in)
+  filletRadius = 0.02,
+  filletSteps = 6,
+}) {
+  const { upper, lower } = naca4Coordinates(naca, chordSamples, 1.0);
+  const crossSection = upper.concat([...lower].reverse());
+  const ringCount = Math.max(2, sections);
+
+  const verts = [];
+  const indices = [];
+
+  const twistRad = (twistDeg * Math.PI) / 180;
+  const dihedralRad = (dihedralDeg * Math.PI) / 180;
+
+  function sectionParams(i) {
+    const s = i / (ringCount - 1); // 0..1
+    const scale = chord * (1 - s + s * taper);
+    const z = s * span;
+    const twist = s * twistRad;
+    const dihedral = Math.sin(dihedralRad) * z;
+    return { scale, z, twist, dihedral };
+  }
+
+  const ringOffsets = [];
+  for (let i = 0; i < ringCount; i++) {
+    const { scale, z, twist, dihedral } = sectionParams(i);
+    const cosT = Math.cos(twist), sinT = Math.sin(twist);
+    const baseIndex = verts.length / 3;
+    ringOffsets.push(baseIndex);
+    for (let p = 0; p < crossSection.length; p++) {
+      const [x0, y0] = crossSection[p];
+      const x = (x0 - 0.25) * scale; // quarter-chord at origin
+      const y = y0 * scale + dihedral; // dihedral raise
+      const xr = x * cosT - y * sinT;
+      const yr = x * sinT + y * cosT;
+      verts.push(xr, yr, z);
+    }
+  }
+
+  const ringSize = crossSection.length;
+  for (let i = 0; i < ringCount - 1; i++) {
+    const r0 = ringOffsets[i];
+    const r1 = ringOffsets[i + 1];
+    for (let j = 0; j < ringSize; j++) {
+      const a = r0 + j;
+      const b = r0 + ((j + 1) % ringSize);
+      const c = r1 + ((j + 1) % ringSize);
+      const d = r1 + j;
+      indices.push(a, b, c, a, c, d);
+    }
+  }
+
+  function addCap(baseOffset, flip=false) {
+    const start = baseOffset;
+    const centerIndex = verts.length / 3;
+    let cx = 0, cy = 0, cz = 0;
+    for (let j = 0; j < ringSize; j++) {
+      cx += verts[(start + j) * 3 + 0];
+      cy += verts[(start + j) * 3 + 1];
+      cz += verts[(start + j) * 3 + 2];
+    }
+    cx /= ringSize; cy /= ringSize; cz /= ringSize;
+    verts.push(cx, cy, cz);
+    for (let j = 0; j < ringSize; j++) {
+      const a = start + j;
+      const b = start + ((j + 1) % ringSize);
+      if (flip) indices.push(centerIndex, b, a); else indices.push(centerIndex, a, b);
+    }
+  }
+  // root and tip caps
+  addCap(0, true);
+  addCap(ringOffsets[ringOffsets.length - 1], false);
+
+  // === Winglet generation ===
+  if (wingletHeight > 0.0001) {
+    const tipStart = ringOffsets[ringOffsets.length - 1];
+    const tipRing = [];
+    for (let j = 0; j < ringSize; j++) {
+      tipRing.push([
+        verts[(tipStart + j) * 3 + 0],
+        verts[(tipStart + j) * 3 + 1],
+        verts[(tipStart + j) * 3 + 2],
+      ]);
+    }
+
+    const wlRings = Math.max(2, Math.round(wingletHeight / (span / ringCount)));
+    const cant = (wingletCantDeg * Math.PI) / 180; // rotate about chord (x) axis
+    const toe = (wingletToeDeg * Math.PI) / 180;   // rotate about vertical (y) axis
+
+    function applyWingletTransforms([x, y, z], h, s) {
+      const scale = (1 - s + s * wingletTaper);
+      const x0 = x * scale;
+      const y0 = y * scale;
+      const z0 = z;
+      // cant around x-axis
+      const yc = y0 * Math.cos(cant * s);
+      const zc = y0 * Math.sin(cant * s);
+      const y1 = yc + h;
+      // toe around vertical (y) axis
+      const xt = x0 * Math.cos(toe * s) + z0 * Math.sin(toe * s);
+      const zt = -x0 * Math.sin(toe * s) + z0 * Math.cos(toe * s);
+      return [xt, y1, zt + zc * 0];
+    }
+
+    const wlOffsets = [];
+    for (let i = 0; i < wlRings; i++) {
+      const s = i / (wlRings - 1);
+      const h = s * wingletHeight;
+      const baseIndex = verts.length / 3;
+      wlOffsets.push(baseIndex);
+      let cx = 0, cy = 0, cz = 0;
+      for (let j = 0; j < ringSize; j++) { cx += tipRing[j][0]; cy += tipRing[j][1]; cz += tipRing[j][2]; }
+      cx/=ringSize; cy/=ringSize; cz/=ringSize;
+      for (let j = 0; j < ringSize; j++) {
+        const vx = tipRing[j][0] - cx;
+        const vy = tipRing[j][1] - cy;
+        const vz = tipRing[j][2] - cz;
+        const [X, Y, Z] = applyWingletTransforms([vx, vy, vz], h, s);
+        verts.push(X + cx, Y + cy, Z + cz);
+      }
+    }
+
+    for (let i = 0; i < wlRings - 1; i++) {
+      const r0 = wlOffsets[i];
+      const r1 = wlOffsets[i + 1];
+      for (let j = 0; j < ringSize; j++) {
+        const a = r0 + j;
+        const b = r0 + ((j + 1) % ringSize);
+        const c = r1 + ((j + 1) % ringSize);
+        const d = r1 + j;
+        indices.push(a, b, c, a, c, d);
+      }
+    }
+
+    addCap(wlOffsets[wlOffsets.length - 1], false);
+
+    // Fillet: interpolate between tip ring and first winglet ring
+    if (filletRadius > 0 && filletSteps >= 2) {
+      const firstWL = wlOffsets[0];
+      const ease = (u) => 0.5 - 0.5 * Math.cos(Math.PI * u);
+      const filletOffsets = [];
+      for (let k = 1; k <= filletSteps; k++) {
+        const u = k / (filletSteps + 1);
+        const s = ease(u);
+        const baseIndex = verts.length / 3;
+        filletOffsets.push(baseIndex);
+        for (let j = 0; j < ringSize; j++) {
+          const ax = verts[(tipStart + j) * 3 + 0];
+          const ay = verts[(tipStart + j) * 3 + 1];
+          const az = verts[(tipStart + j) * 3 + 2];
+          const bx = verts[(firstWL + j) * 3 + 0];
+          const by = verts[(firstWL + j) * 3 + 1];
+          const bz = verts[(firstWL + j) * 3 + 2];
+          const x = ax * (1 - s) + bx * s;
+          const y = ay * (1 - s) + by * s;
+          const z = az * (1 - s) + bz * s;
+          verts.push(x, y, z);
+        }
+      }
+      let prev = tipStart;
+      for (let r = 0; r < filletOffsets.length; r++) {
+        const cur = filletOffsets[r];
+        for (let j = 0; j < ringSize; j++) {
+          const a = prev + j;
+          const b = prev + ((j + 1) % ringSize);
+          const c = cur + ((j + 1) % ringSize);
+          const d = cur + j;
+          indices.push(a, b, c, a, c, d);
+        }
+        prev = cur;
+      }
+      const cur = wlOffsets[0];
+      for (let j = 0; j < ringSize; j++) {
+        const a = prev + j;
+        const b = prev + ((j + 1) % ringSize);
+        const c = cur + ((j + 1) % ringSize);
+        const d = cur + j;
+        indices.push(a, b, c, a, c, d);
+      }
+    }
+  }
+
+  const geom = new THREE.BufferGeometry();
+  const position = new Float32Array(verts);
+  const idx = new (position.length / 3 > 65535 ? Uint32Array : Uint16Array)(indices);
+  geom.setAttribute("position", new THREE.BufferAttribute(position, 3));
+  geom.setIndex(new THREE.BufferAttribute(idx, 1));
+  geom.computeVertexNormals();
+  return geom;
+}
+
+function Axes() {
+  const { scene } = useThree();
+  const ref = useRef();
+  useMemo(() => {
+    const axes = new THREE.AxesHelper(0.5);
+    scene.add(axes);
+    return () => scene.remove(axes);
+  }, [scene]);
+  return null;
+}
+
+function Grid() {
+  const { scene } = useThree();
+  useMemo(() => {
+    const grid = new THREE.GridHelper(5, 50, 0x888888, 0x444444);
+    grid.rotation.x = Math.PI / 2; // lay in XZ plane
+    scene.add(grid);
+    return () => scene.remove(grid);
+  }, [scene]);
+  return null;
+}
+
+function WingMesh({ params }) {
+  const meshRef = useRef();
+  const geom = useMemo(() => buildWingGeometry(params), [params]);
+  return (
+    <mesh ref={meshRef} geometry={geom} castShadow receiveShadow>
+      <meshStandardMaterial metalness={0.1} roughness={0.6} />
+    </mesh>
+  );
+}
+
+function ExportButtons({ params }) {
+  const [busy, setBusy] = useState(false);
+  const sceneRef = useRef();
+
+  // Build a temporary mesh for export to ensure geometry is fresh
+  function buildMesh() {
+    const geom = buildWingGeometry(params);
+    const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
+    return mesh;
+  }
+
+  const exportSTL = () => {
+    setBusy(true);
+    try {
+      const exporter = new STLExporter();
+      const mesh = buildMesh();
+      const scene = new THREE.Scene();
+      scene.add(mesh);
+      const stl = exporter.parse(scene);
+      const blob = new Blob([stl], { type: "model/stl" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `airfoil_${params.naca}_c${params.chord}_s${params.span}.stl`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex gap-2 mt-2">
+      <button onClick={exportSTL} disabled={busy} className="px-3 py-2 rounded-xl shadow bg-black text-white">
+        {busy ? "Exporting…" : "Export STL"}
+      </button>
+    </div>
+  );
+}
+
+function NumberInput({ label, value, step = 0.01, min, max, onChange, suffix }) {
+  return (
+    <label className="flex items-center justify-between gap-2 text-sm">
+      <span className="text-gray-700">{label}</span>
+      <div className="flex items-center gap-1">
+        <input
+          className="w-28 px-2 py-1 rounded-lg border border-gray-300"
+          type="number"
+          step={step}
+          min={min}
+          max={max}
+          value={value}
+          onChange={(e) => onChange(parseFloat(e.target.value))}
+        />
+        {suffix ? <span className="text-gray-500">{suffix}</span> : null}
+      </div>
+    </label>
+  );
+}
+
+function AirfoilControls({ params, setParams }) {
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+      <label className="flex items-center justify-between gap-2 text-sm">
+        <span className="text-gray-700">NACA 4‑digit</span>
+        <input
+          className="w-28 px-2 py-1 rounded-lg border border-gray-300"
+          value={params.naca}
+          onChange={(e) => setParams({ ...params, naca: e.target.value.replace(/[^0-9]/g, '') })}
+          placeholder="2412"
+          maxLength={4}
+        />
+      </label>
+      <NumberInput label="Chord (m)" value={params.chord} step={0.01} min={0.01}
+        onChange={(v) => setParams({ ...params, chord: v })} />
+      <NumberInput label="Span (m)" value={params.span} step={0.01} min={0.01}
+        onChange={(v) => setParams({ ...params, span: v })} />
+      <NumberInput label="Taper ratio" value={params.taper} step={0.01} min={0.1} max={1.5}
+        onChange={(v) => setParams({ ...params, taper: v })} />
+      <NumberInput label="Twist (deg)" value={params.twistDeg} step={0.1} min={-30} max={30}
+        onChange={(v) => setParams({ ...params, twistDeg: v })} />
+      <NumberInput label="Dihedral (deg)" value={params.dihedralDeg} step={0.1} min={-20} max={20}
+        onChange={(v) => setParams({ ...params, dihedralDeg: v })} />
+      <NumberInput label="# chord samples" value={params.chordSamples} step={10} min={50} max={800}
+        onChange={(v) => setParams({ ...params, chordSamples: v })} />
+      <NumberInput label="# span sections" value={params.sections} step={1} min={2} max={400}
+        onChange={(v) => setParams({ ...params, sections: v })} />
+
+      {/* Winglet controls */}
+      <div className="col-span-2 md:col-span-3 pt-2 text-sm font-medium">Winglet</div>
+      <NumberInput label="Height (m)" value={params.wingletHeight} step={0.01} min={0}
+        onChange={(v) => setParams({ ...params, wingletHeight: v })} />
+      <NumberInput label="Taper" value={params.wingletTaper} step={0.01} min={0.2} max={1.2}
+        onChange={(v) => setParams({ ...params, wingletTaper: v })} />
+      <NumberInput label="Cant (deg)" value={params.wingletCantDeg} step={1} min={0} max={90}
+        onChange={(v) => setParams({ ...params, wingletCantDeg: v })} />
+      <NumberInput label="Toe-in (deg)" value={params.wingletToeDeg} step={0.5} min={-30} max={30}
+        onChange={(v) => setParams({ ...params, wingletToeDeg: v })} />
+
+      {/* Fillet controls */}
+      <div className="col-span-2 md:col-span-3 pt-2 text-sm font-medium">Fillet</div>
+      <NumberInput label="Radius (m)" value={params.filletRadius} step={0.005} min={0}
+        onChange={(v) => setParams({ ...params, filletRadius: v })} />
+      <NumberInput label="# steps" value={params.filletSteps} step={1} min={2} max={20}
+        onChange={(v) => setParams({ ...params, filletSteps: v })} />
+    </div>
+  );
+}
+
+function Scene({ params }) {
+  return (
+    <Canvas shadows camera={{ position: [1.8, 0.8, 1.8], fov: 50 }} className="rounded-2xl">
+      <ambientLight intensity={0.6} />
+      <directionalLight position={[2, 3, 2]} intensity={0.8} castShadow />
+      <group rotation={[Math.PI / 2, 0, 0]} position={[0, 0, 0]}>
+        <WingMesh params={params} />
+      </group>
+      <OrbitControls makeDefault />
+      <Grid />
+      <Axes />
+    </Canvas>
+  );
+}
+
+export default function AirfoilStudio() {
+  const [params, setParams] = useState({
+    naca: "0012",
+    chord: 0.3,
+    span: 0.6,
+    taper: 0.9,
+    twistDeg: 2,
+    dihedralDeg: 4,
+    chordSamples: 200,
+    sections: 80,
+    // new
+    wingletHeight: 0.15,
+    wingletTaper: 0.6,
+    wingletCantDeg: 65,
+    wingletToeDeg: 0,
+    filletRadius: 0.02,
+    filletSteps: 6,
+  });
+
+  return (
+    <div className="p-4 md:p-6 w-full h-full grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="md:col-span-1 space-y-3">
+        <h1 className="text-xl font-semibold">Airfoil Modeling System</h1>
+        <p className="text-sm text-gray-600">
+          Generate a NACA 4‑digit airfoil wing. Adjust geometry, then export an STL for printing or meshing.
+        </p>
+        <AirfoilControls params={params} setParams={setParams} />
+        <ExportButtons params={params} />
+        <div className="text-xs text-gray-500 pt-2">
+          Tips: Use higher chord samples/sections for smoother meshes. STL is triangulated in meters.
+        </div>
+      </div>
+      <div className="md:col-span-2 h-[60vh] md:h-[75vh]">
+        <Scene params={params} />
+      </div>
+    </div>
+  );
+}
 
